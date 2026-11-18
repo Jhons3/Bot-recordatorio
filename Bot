@@ -53,7 +53,7 @@ TWILIO_TEMPLATE_SID      = os.getenv('TWILIO_TEMPLATE_SID')
 # Configuración de Brevo
 BREVO_API_KEY    = os.getenv('BREVO_API_KEY')
 BREVO_FROM_EMAIL = os.getenv('BREVO_FROM_EMAIL')
-BREVO_FROM_NAME  = os.getenv('BREVO_FROM_NAME', 'BUSINESS MOTORS BUSIMOTT CIA LTDA')
+BREVO_FROM_NAME  = os.getenv('BREVO_FROM_NAME', 'BUSINESS MOTORS BUSIMOTT CIA LTD')
 BREVO_API_URL    = 'https://api.brevo.com/v3/smtp/email'
 
 # Ruta del archivo de clientes
@@ -232,7 +232,7 @@ def crear_html_email(cliente, fecha_vencimiento):
         <p>Agradecemos su puntualidad.</p>
 
         <p>Una vez realizado el pago, registre su comprobante al número de contabilidad:
-           <strong>+593 99 986 5071</strong></p>
+           <strong>+593 99 98x xxxx</strong></p>
 
         <p>También puede reenviar su comprobante respondiendo a este correo para confirmar su pago.</p>
 
