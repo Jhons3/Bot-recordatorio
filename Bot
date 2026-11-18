@@ -1,0 +1,451 @@
+"""
+Bot de Recordatorios de Pagos de Vehículos
+==================================
+Canales de envío:
+- WhatsApp (vía Twilio con plantilla aprobada por Meta)
+- Email (vía Brevo - 300/día GRATIS)
+
+Versión: 5.0.0 GitHub Actions
+Fecha: 2025-01-22
+
+CAMBIOS v5.0:
+- Eliminado while True y schedule (incompatible con GitHub Actions)
+- El cron de GitHub Actions reemplaza el scheduler
+- Zona horaria Ecuador (UTC-5) manejada correctamente
+- Argumento de línea de comandos para forzar grupo manualmente
+- Sin MODO_PRUEBA en el código: se controla con variable de entorno
+"""
+
+import sys
+import time
+import json
+import os
+import logging
+import requests
+import pandas as pd
+from datetime import datetime, timezone, timedelta
+from twilio.rest import Client
+from dotenv import load_dotenv
+
+# ==================== CONFIGURACIÓN DE LOGGING ====================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot_recordatorios.log', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+# ==================== CONFIGURACIÓN ====================
+
+load_dotenv()
+
+# Configuración de Twilio
+TWILIO_ACCOUNT_SID       = os.getenv('TWILIO_ACCOUNT_SID')
+TWILIO_AUTH_TOKEN        = os.getenv('TWILIO_AUTH_TOKEN')
+TWILIO_WHATSAPP_NUMBER   = os.getenv('TWILIO_WHATSAPP_NUMBER')
+TWILIO_TEMPLATE_SID      = os.getenv('TWILIO_TEMPLATE_SID')
+
+# Configuración de Brevo
+BREVO_API_KEY    = os.getenv('BREVO_API_KEY')
+BREVO_FROM_EMAIL = os.getenv('BREVO_FROM_EMAIL')
+BREVO_FROM_NAME  = os.getenv('BREVO_FROM_NAME', 'BUSINESS MOTORS BUSIMOTT CIA LTDA')
+BREVO_API_URL    = 'https://api.brevo.com/v3/smtp/email'
+
+# Ruta del archivo de clientes
+ARCHIVO_CLIENTES = 'clientes.xlsx'
+
+# Zona horaria Ecuador (UTC-5) — GitHub Actions siempre corre en UTC
+ZONA_ECUADOR = timezone(timedelta(hours=-5))
+
+# Constantes de días de pago
+DIAS_GRUPO_14 = [15, 16]
+DIAS_GRUPO_28 = [29, 30]
+
+# ==================== FUNCIONES DE VALIDACIÓN ====================
+
+def validar_email(email):
+    if not email or not isinstance(email, str):
+        return False
+    email = email.strip()
+    if '@' not in email:
+        return False
+    partes = email.split('@')
+    if len(partes) != 2:
+        return False
+    if '.' not in partes[1]:
+        return False
+    if not partes[0] or not partes[1]:
+        return False
+    return True
+
+
+def validar_whatsapp(numero):
+    if not numero:
+        return False, ""
+    try:
+        numero = str(numero).strip()
+        numero_limpio = ''.join(c for c in numero if c.isdigit() or c == '+')
+        if numero_limpio and not numero_limpio.startswith('+'):
+            numero_limpio = '+' + numero_limpio
+        if len(numero_limpio) < 10:
+            return False, numero_limpio
+        if not numero_limpio[1:].isdigit():
+            return False, numero_limpio
+        return True, numero_limpio
+    except Exception as e:
+        logger.error(f"Error validando WhatsApp: {str(e)}")
+        return False, ""
+
+# ==================== FUNCIONES DE FECHA ====================
+
+def obtener_dia_ecuador():
+    """
+    Retorna el día actual en zona horaria Ecuador (UTC-5).
+    CRÍTICO: GitHub Actions corre en UTC. Sin esto, a las 11pm UTC
+    el bot pensaría que es el día siguiente en Ecuador.
+    """
+    ahora_ecuador = datetime.now(ZONA_ECUADOR)
+    logger.info(f"Fecha/hora UTC:     {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"Fecha/hora Ecuador: {ahora_ecuador.strftime('%Y-%m-%d %H:%M:%S')}")
+    return ahora_ecuador.day, ahora_ecuador.month, ahora_ecuador.year
+
+
+def dias_en_mes(mes, año):
+    dias = {
+        1: 31, 2: 28, 3: 31, 4: 30, 5: 31, 6: 30,
+        7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31
+    }
+    if año % 4 == 0 and (año % 100 != 0 or año % 400 == 0):
+        dias[2] = 29
+    return dias[mes]
+
+
+def formatear_fecha_vencimiento(dia, mes, año):
+    max_dias = dias_en_mes(mes, año)
+    if dia > max_dias:
+        dia = max_dias
+    fecha = datetime(año, mes, dia)
+    return fecha.strftime('%d/%m/%Y')
+
+# ==================== FUNCIONES DE CARGA DE DATOS ====================
+
+def cargar_clientes_desde_excel():
+    try:
+        if not os.path.exists(ARCHIVO_CLIENTES):
+            logger.error(f"No se encontró el archivo: {ARCHIVO_CLIENTES}")
+            return []
+
+        logger.info(f"Cargando clientes desde: {ARCHIVO_CLIENTES}")
+        df = pd.read_excel(ARCHIVO_CLIENTES)
+        logger.info(f"Registros leídos: {len(df)}")
+
+        columnas_requeridas = ['nombre', 'cedula', 'whatsapp', 'email', 'vehiculo', 'cuota', 'dia_pago']
+        columnas_faltantes = [col for col in columnas_requeridas if col not in df.columns]
+
+        if columnas_faltantes:
+            logger.error(f"Faltan columnas: {', '.join(columnas_faltantes)}")
+            return []
+
+        registros_iniciales = len(df)
+
+        df = df.dropna(subset=['nombre', 'cedula', 'dia_pago'])
+        df['nombre']   = df['nombre'].astype(str).str.strip()
+        df['cedula']   = df['cedula'].astype(str).str.strip()
+        df['email']    = df['email'].astype(str).str.strip()
+        df['vehiculo'] = df['vehiculo'].astype(str).str.strip()
+        df['whatsapp'] = df['whatsapp'].astype(str).str.strip()
+
+        try:
+            df['dia_pago'] = df['dia_pago'].astype(int)
+        except ValueError as e:
+            logger.error(f"Error en dia_pago: {str(e)}")
+            return []
+
+        df = df[df['dia_pago'].between(1, 31)]
+        df = df[df['cuota'] > 0]
+
+        clientes = df.to_dict('records')
+        registros_descartados = registros_iniciales - len(clientes)
+
+        logger.info(f"Clientes cargados: {len(clientes)}")
+        if registros_descartados > 0:
+            logger.warning(f"Registros descartados: {registros_descartados}")
+
+        return clientes
+
+    except Exception as e:
+        logger.error(f"Error cargando Excel: {str(e)}")
+        return []
+
+
+def filtrar_clientes_por_grupo(clientes, grupo):
+    """
+    grupo=14 → clientes con dia_pago en [15, 16]
+    grupo=28 → clientes con dia_pago en [29, 30]
+    """
+    if grupo == 14:
+        dias_filtro = DIAS_GRUPO_14
+        nombre_grupo = "15-16"
+    elif grupo == 28:
+        dias_filtro = DIAS_GRUPO_28
+        nombre_grupo = "29-30"
+    else:
+        logger.error(f"Grupo inválido: {grupo}")
+        return []
+
+    clientes_filtrados = [c for c in clientes if c['dia_pago'] in dias_filtro]
+    logger.info(f"Clientes grupo {nombre_grupo}: {len(clientes_filtrados)}")
+    return clientes_filtrados
+
+# ==================== FUNCIÓN DE ENVÍO EMAIL (BREVO) ====================
+
+def crear_html_email(cliente, fecha_vencimiento):
+    return f"""
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    </head>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+
+        <h2 style="color: #2c3e50; border-bottom: 2px solid #007bff; padding-bottom: 10px;">
+            🚗 Recordatorio de Pago - Cuota de Vehículo
+        </h2>
+
+        <p>Estimado/a <strong>{cliente['nombre']}</strong>,</p>
+        <p style="color: #666; font-size: 0.95em;">Cédula: <strong>{cliente['cedula']}</strong></p>
+
+        <p>Le recordamos que su cuota mensual del vehículo vence próximamente.</p>
+
+        <div style="background-color: #f8f9fa; padding: 15px; border-left: 4px solid #007bff; margin: 20px 0; border-radius: 4px;">
+            <p style="margin: 5px 0;"><strong>Vehículo:</strong> {cliente['vehiculo']}</p>
+            <p style="margin: 5px 0;"><strong>Monto de la cuota:</strong> ${float(cliente['cuota']):.2f}</p>
+            <p style="margin: 5px 0;"><strong>Fecha de vencimiento:</strong> {fecha_vencimiento}</p>
+        </div>
+
+        <p>Agradecemos su puntualidad.</p>
+
+        <p>Una vez realizado el pago, registre su comprobante al número de contabilidad:
+           <strong>+593 99 986 5071</strong></p>
+
+        <p>También puede reenviar su comprobante respondiendo a este correo para confirmar su pago.</p>
+
+        <hr style="border: none; border-top: 1px solid #ddd; margin: 30px 0;">
+
+        <p style="margin-top: 30px; color: #666;">
+            Atentamente,<br>
+            <strong>BUSINESS MOTORS BUSIMOTT CIA LTDA</strong>
+        </p>
+
+        <p style="font-size: 0.8em; color: #999; margin-top: 20px;">
+            Este es un mensaje automático del sistema de cobranzas.
+        </p>
+    </body>
+    </html>
+    """
+
+
+def enviar_brevo(cliente, fecha_vencimiento):
+    if not BREVO_API_KEY:
+        logger.warning("Brevo no configurado")
+        return False
+
+    try:
+        if not validar_email(cliente.get('email', '')):
+            logger.warning(f"Email inválido: {cliente['nombre']}")
+            return False
+
+        html_content = crear_html_email(cliente, fecha_vencimiento)
+
+        headers = {
+            'api-key': BREVO_API_KEY,
+            'Content-Type': 'application/json'
+        }
+
+        data = {
+            'sender': {'name': BREVO_FROM_NAME, 'email': BREVO_FROM_EMAIL},
+            'to': [{'email': cliente['email'], 'name': cliente['nombre']}],
+            'subject': f"Recordatorio: Cuota de su vehículo {cliente['vehiculo']}",
+            'htmlContent': html_content
+        }
+
+        response = requests.post(BREVO_API_URL, headers=headers, data=json.dumps(data), timeout=10)
+
+        if response.status_code == 201:
+            logger.info(f" Email enviado: {cliente['nombre']} ({cliente['email']})")
+            return True
+        else:
+            logger.error(f" Error Brevo HTTP {response.status_code}: {response.text}")
+            return False
+
+    except requests.exceptions.Timeout:
+        logger.error(f" Timeout email: {cliente['nombre']}")
+        return False
+    except Exception as e:
+        logger.error(f" Error Brevo: {str(e)}")
+        return False
+
+# ==================== FUNCIÓN DE ENVÍO WHATSAPP ====================
+
+def enviar_whatsapp(cliente, fecha_vencimiento):
+    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_NUMBER, TWILIO_TEMPLATE_SID]):
+        logger.warning(" Twilio incompleto en variables de entorno")
+        return False
+
+    try:
+        es_valido, numero_limpio = validar_whatsapp(cliente.get('whatsapp', ''))
+
+        if not es_valido:
+            logger.warning(f" WhatsApp inválido: {cliente['nombre']}")
+            return False
+
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+        variables = {
+            "1": str(cliente['nombre']),
+            "2": str(cliente['cedula']),
+            "3": str(cliente['vehiculo']),
+            "4": f"${float(cliente['cuota']):.2f}",
+            "5": str(fecha_vencimiento)
+        }
+
+        message = client.messages.create(
+            from_=TWILIO_WHATSAPP_NUMBER,
+            to=f"whatsapp:{numero_limpio}",
+            content_sid=TWILIO_TEMPLATE_SID,
+            content_variables=json.dumps(variables)
+        )
+
+        logger.info(f" WhatsApp enviado: {cliente['nombre']} ({numero_limpio}) - SID: {message.sid}")
+        return True
+
+    except Exception as e:
+        logger.error(f" Error WhatsApp: {str(e)}")
+        return False
+
+# ==================== FUNCIÓN PRINCIPAL DE ENVÍO ====================
+
+def enviar_recordatorios(grupo):
+    """
+    grupo: 14 (para clientes días 15-16) o 28 (para clientes días 29-30)
+    """
+    logger.info("=" * 70)
+    logger.info(f"Iniciando envío - Grupo {grupo}")
+    logger.info("=" * 70)
+
+    todos_clientes = cargar_clientes_desde_excel()
+    if not todos_clientes:
+        logger.error("No hay clientes cargados")
+        return
+
+    clientes = filtrar_clientes_por_grupo(todos_clientes, grupo)
+    if not clientes:
+        logger.info(f"No hay clientes para el grupo {grupo}")
+        return
+
+    _, mes, año = obtener_dia_ecuador()
+
+    exitosos_whatsapp = 0
+    exitosos_email    = 0
+    fallidos_whatsapp = 0
+    fallidos_email    = 0
+
+    for idx, cliente in enumerate(clientes, 1):
+        logger.info(f"\nCliente {idx}/{len(clientes)}: {cliente['nombre']}")
+
+        fecha_vencimiento = formatear_fecha_vencimiento(cliente['dia_pago'], mes, año)
+
+        if cliente.get('whatsapp'):
+            if enviar_whatsapp(cliente, fecha_vencimiento):
+                exitosos_whatsapp += 1
+            else:
+                fallidos_whatsapp += 1
+
+        if cliente.get('email'):
+            if enviar_brevo(cliente, fecha_vencimiento):
+                exitosos_email += 1
+            else:
+                fallidos_email += 1
+
+        if idx < len(clientes):
+            time.sleep(2)
+
+    logger.info("\n" + "=" * 70)
+    logger.info("RESUMEN")
+    logger.info("=" * 70)
+    logger.info(f"Total procesados: {len(clientes)}")
+    logger.info(f"WhatsApp → Exitosos: {exitosos_whatsapp} | Fallidos: {fallidos_whatsapp}")
+    logger.info(f"Email    → Exitosos: {exitosos_email} | Fallidos: {fallidos_email}")
+    logger.info(f"TOTAL enviados: {exitosos_whatsapp + exitosos_email}")
+    logger.info("=" * 70)
+
+# ==================== EJECUCIÓN PRINCIPAL ====================
+
+def main():
+    """
+    Uso:
+      python bot_recordatorios.py          → detecta el día automáticamente
+      python bot_recordatorios.py 14       → fuerza grupo 14 (días 15-16)
+      python bot_recordatorios.py 28       → fuerza grupo 28 (días 29-30)
+    """
+    logger.info("=" * 70)
+    logger.info("BOT DE RECORDATORIOS DE PAGOS v5.0.0")
+    logger.info("=" * 70)
+
+    # ── Verificar credenciales ──────────────────────────────────────────────
+    errores = []
+    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_NUMBER, TWILIO_TEMPLATE_SID]):
+        errores.append("Twilio: faltan variables de entorno")
+    if not BREVO_API_KEY:
+        errores.append("Brevo: falta BREVO_API_KEY")
+    if not os.path.exists(ARCHIVO_CLIENTES):
+        errores.append(f"Excel no encontrado: {ARCHIVO_CLIENTES}")
+
+    if errores:
+        for e in errores:
+            logger.error(f" {e}")
+        sys.exit(1)
+
+    logger.info(" Twilio configurado")
+    logger.info(" Brevo configurado")
+    logger.info(" Excel encontrado")
+
+    # ── Determinar qué grupo enviar ─────────────────────────────────────────
+    # Argumento manual (útil para pruebas o re-envíos)
+    if len(sys.argv) > 1:
+        try:
+            grupo_forzado = int(sys.argv[1])
+            if grupo_forzado not in [14, 28]:
+                logger.error("Argumento inválido. Usa 14 o 28.")
+                sys.exit(1)
+            logger.info(f"Grupo forzado por argumento: {grupo_forzado}")
+            enviar_recordatorios(grupo_forzado)
+            return
+        except ValueError:
+            logger.error("Argumento inválido. Debe ser 14 o 28.")
+            sys.exit(1)
+
+    # Detección automática por día de Ecuador
+    dia_hoy, mes_hoy, año_hoy = obtener_dia_ecuador()
+    logger.info(f"Día Ecuador: {dia_hoy}/{mes_hoy}/{año_hoy}")
+
+    if dia_hoy == 14:
+        logger.info("→ Ejecutando grupo 14 (clientes días 15-16)")
+        enviar_recordatorios(14)
+    elif dia_hoy == 28:
+        logger.info("→ Ejecutando grupo 28 (clientes días 29-30)")
+        enviar_recordatorios(28)
+    else:
+        logger.info(f"  Hoy es día {dia_hoy}. No hay envíos programados para hoy.")
+        logger.info("   Los envíos se realizan los días 14 y 28 de cada mes.")
+
+
+if __name__ == "__main__":
+    main()
+
